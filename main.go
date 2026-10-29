@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofri/go-github-pagination/githubpagination"
@@ -34,18 +36,22 @@ const (
 )
 
 var loop, report bool
-var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
+var deleteExistingRepos, enablePullRequests, gitlabInsecure, migrateClosedMergeRequests, noProgress, noPrompt, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabScheme, gitlabToken, projectsCsvPath, renameTrunkBranch string
+var gitlabCAFile string
+var gitlabCABundle []byte
 var mergeRequestsAge int
 
 var (
-	cache          *objectCache
-	errCount       int
-	logger         hclog.Logger
-	gh             *github.Client
-	gl             *gitlab.Client
-	maxConcurrency int
-	version        = "development"
+	cache                   *objectCache
+	errCount                atomic.Int64
+	logger                  hclog.Logger
+	gh                      *github.Client
+	gl                      *gitlab.Client
+	maxConcurrency          int
+	mergeRequestConcurrency int
+	githubWritesPerHour     int
+	version                 = "development"
 )
 
 type Project = []string
@@ -56,6 +62,8 @@ type Report struct {
 	MergeRequestsCount int
 }
 
+var rateLimitMessage = regexp.MustCompile(`(?i)rate limit`)
+
 type GitHubError struct {
 	Message          string
 	DocumentationURL string `json:"documentation_url"`
@@ -63,6 +71,15 @@ type GitHubError struct {
 
 func main() {
 	var err error
+
+	// Log output goes through a switchable writer so it can be routed above the
+	// progress bars once those are enabled, after the flags are parsed.
+	logOutput := &switchableWriter{w: os.Stderr}
+	logger = hclog.New(&hclog.LoggerOptions{
+		Name:   "gitlab-migrator",
+		Level:  hclog.LevelFromString(os.Getenv("LOG_LEVEL")),
+		Output: logOutput,
+	})
 
 	// Bypass pre-emptive rate limit checks in the GitHub client, as we will handle these via go-retryablehttp
 	valueCtx := context.WithValue(context.Background(), github.BypassRateLimitCheck, true)
@@ -79,29 +96,29 @@ func main() {
 	go func() {
 		select {
 		case <-c:
+			logger.Warn("interrupt received, finishing cleanup; press Ctrl-C again to exit immediately")
 			cancel()
+			// Restore the default action so a second Ctrl-C terminates the process.
+			signal.Stop(c)
 		case <-ctx.Done():
 		}
 	}()
-
-	logger = hclog.New(&hclog.LoggerOptions{
-		Name:  "gitlab-migrator",
-		Level: hclog.LevelFromString(os.Getenv("LOG_LEVEL")),
-	})
 
 	cache = newObjectCache()
 
 	var showVersion bool
 	var mergeRequestsAgeRaw string
-	fmt.Printf(fmt.Sprintf("gitlab-migrator %s\n", version))
+	fmt.Printf("gitlab-migrator %s\n", version)
 
 	flag.BoolVar(&loop, "loop", false, "continue migrating until canceled")
 	flag.BoolVar(&report, "report", false, "report on primitives to be migrated instead of beginning migration")
 
 	flag.BoolVar(&deleteExistingRepos, "delete-existing-repos", false, "whether existing repositories should be deleted before migrating")
 	flag.BoolVar(&enablePullRequests, "migrate-pull-requests", false, "whether pull requests should be migrated")
-	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to the GitLab API")
+	flag.BoolVar(&gitlabInsecure, "gitlab-insecure", false, "when true, skip TLS certificate verification when connecting to GitLab (API and git); prefer -gitlab-ca-file")
+	flag.StringVar(&gitlabCAFile, "gitlab-ca-file", "", "path to a PEM file with additional CA certificates to trust for the GitLab server")
 	flag.BoolVar(&migrateClosedMergeRequests, "migrate-closed-merge-requests", true, "when true, migrate merge requests that were closed without merging; when false, only merged (and open) merge requests are migrated")
+	flag.BoolVar(&noProgress, "no-progress", false, "disable the live progress bars (they are also disabled when stderr is not a terminal)")
 	flag.BoolVar(&noPrompt, "no-prompt", false, "skip interactive confirmation prompts (warnings are still printed); useful for non-interactive/automated runs")
 	flag.BoolVar(&renameMasterToMain, "rename-master-to-main", false, "rename master branch to main and update pull requests (incompatible with -rename-trunk-branch)")
 	flag.BoolVar(&skipInvalidMergeRequests, "skip-invalid-merge-requests", false, "when true, will log and skip invalid merge requests instead of raising an error")
@@ -119,8 +136,17 @@ func main() {
 	flag.StringVar(&renameTrunkBranch, "rename-trunk-branch", "", "specifies the new trunk branch name (incompatible with -rename-master-to-main)")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
+	flag.IntVar(&mergeRequestConcurrency, "merge-request-concurrency", 4, "how many merge requests per project to read from GitLab in parallel; git operations and GitHub writes stay serial")
+	flag.IntVar(&githubWritesPerHour, "github-writes-per-hour", 500, "maximum content-creating GitHub API requests per hour; GitHub documents 500 for github.com, higher values are lowered automatically when GitHub rate-limits writes; 0 or less disables the limit")
 
 	flag.Parse()
+
+	if !noProgress && !showVersion && !report {
+		enableProgress()
+		if progress != nil {
+			logOutput.set(progress)
+		}
+	}
 
 	if showVersion {
 		return
@@ -203,11 +229,17 @@ func main() {
 		}
 	}
 
+	// The throttle sits below the retry client, so every attempt, retries included, passes it: it sees
+	// every 403/429 response and sets the shared pause, and each retried attempt waits for that pause
+	// and for the write limiter.
+	pooled := cleanhttp.DefaultPooledClient()
+	pooled.Transport = newThrottlingTransport(pooled.Transport, githubWritesPerHour)
+
 	retryClient := &retryablehttp.Client{
-		HTTPClient:   cleanhttp.DefaultPooledClient(),
+		HTTPClient:   pooled,
 		Logger:       nil,
 		RetryMax:     8,
-		RetryWaitMin: 30 * time.Second,
+		RetryWaitMin: 5 * time.Second,
 		RetryWaitMax: 300 * time.Second,
 	}
 
@@ -215,18 +247,21 @@ func main() {
 		requestMethod := "unknown"
 		requestUrl := "unknown"
 
-		if req := resp.Request; req != nil {
-			requestMethod = req.Method
-			if req.URL != nil {
-				requestUrl = req.URL.String()
-			}
-		}
+		status := 0
 
 		defer func() {
-			logger.Trace("waiting before retrying failed API request", "method", requestMethod, "url", requestUrl, "status", resp.StatusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
+			logger.Trace("waiting before retrying failed API request", "method", requestMethod, "url", requestUrl, "status", status, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
 		}()
 
 		if resp != nil {
+			status = resp.StatusCode
+			if req := resp.Request; req != nil {
+				requestMethod = req.Method
+				if req.URL != nil {
+					requestUrl = req.URL.String()
+				}
+			}
+
 			// Check the Retry-After header
 			if s, ok := resp.Header["Retry-After"]; ok {
 				if retryAfter, err := strconv.ParseInt(s[0], 10, 64); err == nil {
@@ -269,8 +304,9 @@ func main() {
 	}
 
 	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		// Retry network errors, but not certificate or redirect errors
 		if err != nil {
-			return false, err
+			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 		}
 
 		// Potential connection reset
@@ -296,11 +332,16 @@ func main() {
 				}
 				return false, fmt.Errorf("received 403 with response: %v", msg)
 			}
+
+			// Only retry a 403 when it is a rate limit, not a permission error
+			if resp.Header.Get("Retry-After") == "" && !rateLimitMessage.MatchString(errResp.Message) {
+				return false, nil
+			}
 		}
 
 		retryableStatuses := []int{
 			http.StatusTooManyRequests, // rate-limiting
-			http.StatusForbidden,       // rate-limiting
+			http.StatusForbidden,       // rate-limiting (other 403s are rejected above)
 
 			http.StatusRequestTimeout,
 			http.StatusFailedDependency,
@@ -330,9 +371,7 @@ func main() {
 		return false, nil
 	}
 
-	transport := &gitHubAdvancedSearchModder{
-		base: &retryablehttp.RoundTripper{Client: retryClient},
-	}
+	transport := &retryablehttp.RoundTripper{Client: retryClient}
 	client := githubpagination.NewClient(transport, githubpagination.WithPerPage(100))
 
 	if githubDomain == defaultGithubDomain {
@@ -352,6 +391,25 @@ func main() {
 			insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		}
 		gitlabOpts = append(gitlabOpts, gitlab.WithHTTPClient(insecureClient))
+	} else if gitlabCAFile != "" {
+		var err error
+		if gitlabCABundle, err = os.ReadFile(gitlabCAFile); err != nil {
+			logger.Error(fmt.Sprintf("reading -gitlab-ca-file: %v", err))
+			os.Exit(1)
+		}
+		pool, _ := x509.SystemCertPool()
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(gitlabCABundle) {
+			logger.Error(fmt.Sprintf("-gitlab-ca-file %s contains no valid PEM certificate", gitlabCAFile))
+			os.Exit(1)
+		}
+		caClient := cleanhttp.DefaultPooledClient()
+		if caTransport, ok := caClient.Transport.(*http.Transport); ok {
+			caTransport.TLSClientConfig = &tls.Config{RootCAs: pool}
+		}
+		gitlabOpts = append(gitlabOpts, gitlab.WithHTTPClient(caClient))
 	}
 	if gitlabScheme != defaultGitlabScheme || gitlabDomain != defaultGitlabDomain {
 		gitlabUrl := fmt.Sprintf("%s://%s", gitlabScheme, gitlabDomain)
@@ -384,11 +442,14 @@ func main() {
 	if report {
 		printReport(ctx, projects)
 	} else {
-		if err = performMigration(ctx, projects); err != nil {
+		err = performMigration(ctx, projects)
+		progress.stop()
+		logOutput.set(os.Stderr)
+		if err != nil {
 			sendErr(err)
 			os.Exit(1)
-		} else if errCount > 0 {
-			logger.Warn(fmt.Sprintf("encountered %d errors during migration, review log output for details", errCount))
+		} else if errCount.Load() > 0 {
+			logger.Warn(fmt.Sprintf("encountered %d errors during migration, review log output for details", errCount.Load()))
 			os.Exit(1)
 		}
 	}
@@ -406,7 +467,6 @@ func printReport(ctx context.Context, projects []Project) {
 
 		result, err := reportProject(ctx, proj)
 		if err != nil {
-			errCount++
 			sendErr(err)
 		}
 
@@ -494,6 +554,7 @@ func performMigration(ctx context.Context, projects []Project) error {
 	}
 
 	logger.Info(fmt.Sprintf("processing %d project(s) with %d workers", len(projects), concurrency))
+	progress.setProjects(len(projects))
 
 	var wg sync.WaitGroup
 	queue := make(chan Project, concurrency*2)
@@ -509,17 +570,17 @@ func performMigration(ctx context.Context, projects []Project) error {
 					break
 				}
 
-				proj, err := newProject(slugs)
+				proj, err := newProject(ctx, slugs)
 				if err != nil {
-					errCount++
 					sendErr(err)
+					progress.projectDone()
 					continue
 				}
 
 				if err := proj.migrate(ctx); err != nil {
-					errCount++
 					sendErr(err)
 				}
+				progress.projectDone()
 			}
 		}()
 	}
@@ -530,7 +591,11 @@ func performMigration(ctx context.Context, projects []Project) error {
 				break
 			}
 
-			queue <- proj
+			select {
+			case queue <- proj:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 
@@ -545,8 +610,9 @@ func performMigration(ctx context.Context, projects []Project) error {
 		}
 	} else {
 		queueProjects()
-		close(queue)
 	}
+
+	close(queue)
 
 	wg.Wait()
 
